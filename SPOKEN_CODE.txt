@@ -1,0 +1,160 @@
+import os
+import numpy as np
+import librosa
+from tqdm import tqdm
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier, VotingClassifier, StackingClassifier
+from sklearn.svm import SVC
+from sklearn.mixture import GaussianMixture
+from sklearn.decomposition import PCA
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import GridSearchCV
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+base_path = '/kaggle/input/spoken'
+train_dir = os.path.join(base_path, 'Train')
+test_dir = os.path.join(base_path, 'Test')
+
+def get_file_list(data_dir, is_train=True):
+    filepaths = []
+    labels = []
+    for label in sorted(os.listdir(data_dir)):
+        class_dir = os.path.join(data_dir, label)
+        if not os.path.isdir(class_dir):
+            continue
+        search_dir = os.path.join(class_dir, 'wav') if is_train else class_dir
+        if not os.path.isdir(search_dir):
+            continue
+        for fname in os.listdir(search_dir):
+            if fname.lower().endswith('.wav'):
+                filepaths.append(os.path.join(search_dir, fname))
+                labels.append(label)
+    return filepaths, labels
+
+train_files, train_labels = get_file_list(train_dir, is_train=True)
+test_files, test_labels = get_file_list(test_dir, is_train=False)
+
+print(f"Loaded {len(train_files)} files from {train_dir}")
+print(f"Loaded {len(test_files)} files from {test_dir}")
+
+def extract_features(files, n_mfcc=13, max_len=150):
+    features = []
+    errors = 0
+    for path in tqdm(files, desc="Extracting Features"):
+        try:
+            x, sr = librosa.load(path, sr=16000)
+            mfcc = librosa.feature.mfcc(y=x, sr=sr, n_mfcc=n_mfcc, n_fft=min(512, len(x)))
+            delta = librosa.feature.delta(mfcc)
+            deltadelta = librosa.feature.delta(mfcc, order=2)
+            feat = np.vstack([mfcc, delta, deltadelta])
+            if feat.shape[1] < max_len:
+                pad_width = max_len - feat.shape[1]
+                feat = np.pad(feat, ((0,0),(0,pad_width)), mode='constant')
+            else:
+                feat = feat[:, :max_len]
+            features.append(feat.flatten())
+        except Exception as e:
+            errors += 1
+            features.append(np.zeros((n_mfcc*3)*max_len))
+    return np.array(features), errors
+
+X_train, err_train = extract_features(train_files)
+X_test, err_test = extract_features(test_files)
+print(f"Feature shape (train): {X_train.shape}")
+print(f"Feature shape (test): {X_test.shape}")
+print(f"Number of feature extraction errors: {err_train} out of {len(train_files)}")
+print(f"Number of feature extraction errors: {err_test} out of {len(test_files)}")
+
+le = LabelEncoder()
+y_train = le.fit_transform(train_labels)
+y_test = le.transform(test_labels)
+print(f"Labels found: {le.classes_}")
+
+print("\nTuning Random Forest hyperparameters...")
+rf_param_grid = {
+    'n_estimators': [100, 200, 300],
+    'max_depth': [None, 20, 30],
+    'min_samples_split': [2, 4],
+}
+rf_gs = GridSearchCV(RandomForestClassifier(random_state=0), rf_param_grid, cv=3, n_jobs=-1)
+rf_gs.fit(X_train, y_train)
+rf_best = rf_gs.best_estimator_
+y_pred_rf = rf_best.predict(X_test)
+print(f"Best Random Forest params: {rf_gs.best_params_}")
+print("Random Forest accuracy: %.4f" % accuracy_score(y_test, y_pred_rf))
+print("Random Forest Classification Report:\n", classification_report(y_test, y_pred_rf, target_names=le.classes_))
+
+print("\nTuning SVM hyperparameters...")
+svm_param_grid = {'C': [1, 10], 'gamma': ['scale', 'auto']}
+svm_gs = GridSearchCV(SVC(kernel='rbf', probability=True), svm_param_grid, cv=3, n_jobs=-1)
+svm_gs.fit(X_train, y_train)
+svm_best = svm_gs.best_estimator_
+y_pred_svm = svm_best.predict(X_test)
+print(f"Best SVM params: {svm_gs.best_params_}")
+print("SVM (tuned) accuracy: %.4f" % accuracy_score(y_test, y_pred_svm))
+print("SVM (tuned) Classification Report:\n", classification_report(y_test, y_pred_svm, target_names=le.classes_))
+
+print("\nTuning GMM classifier (with PCA)...")
+pca = PCA(n_components=50, random_state=0)
+X_train_pca = pca.fit_transform(X_train)
+X_test_pca = pca.transform(X_test)
+best_gmm_acc = 0
+best_gmm_report = ""
+for cov in ['diag', 'full']:
+    for n_comp in [2, 4, 6, 8]:
+        gmms = []
+        skip = False
+        for i in range(len(le.classes_)):
+            n_samples = np.sum(y_train == i)
+            if n_samples < n_comp:
+                skip = True
+                break
+            gmms.append(GaussianMixture(n_components=n_comp, covariance_type=cov, random_state=0, reg_covar=1e-6))
+        if skip:
+            print(f"Skipping cov={cov}, n_components={n_comp} due to too few samples in at least one class.")
+            continue
+        for i, gmm in enumerate(gmms):
+            gmm.fit(X_train_pca[y_train==i])
+        log_likelihood = np.array([[gmm.score_samples([x])[0] for gmm in gmms] for x in X_test_pca])
+        y_pred_gmm = np.argmax(log_likelihood, axis=1)
+        acc = accuracy_score(y_test, y_pred_gmm)
+        if acc > best_gmm_acc:
+            best_gmm_acc = acc
+            best_gmm_report = classification_report(y_test, y_pred_gmm, target_names=le.classes_)
+        print(f"GMM accuracy (cov_type={cov}, n_components={n_comp}): {acc:.4f}")
+print(f"\nBest GMM accuracy: {best_gmm_acc:.4f}")
+print("Best GMM Classification Report:\n", best_gmm_report)
+
+print("\nTraining HistGradientBoostingClassifier...")
+hgb = HistGradientBoostingClassifier(random_state=0)
+hgb.fit(X_train, y_train)
+y_pred_hgb = hgb.predict(X_test)
+print("HistGradientBoostingClassifier accuracy: %.4f" % accuracy_score(y_test, y_pred_hgb))
+print("HistGradientBoostingClassifier Classification Report:\n", classification_report(y_test, y_pred_hgb, target_names=le.classes_))
+
+print("\nTraining StackingClassifier (HGB + RF + Tuned SVM)...")
+stack = StackingClassifier(
+    estimators=[
+        ('hgb', hgb),
+        ('rf', rf_best),
+        ('svm', svm_best),
+    ],
+    final_estimator=RandomForestClassifier(n_estimators=100, random_state=0),
+    n_jobs=-1
+)
+stack.fit(X_train, y_train)
+y_pred_stack = stack.predict(X_test)
+print("StackingClassifier accuracy: %.4f" % accuracy_score(y_test, y_pred_stack))
+print("StackingClassifier Classification Report:\n", classification_report(y_test, y_pred_stack, target_names=le.classes_))
+
+print("\nTraining Voting Ensemble (RF + Tuned SVM)...")
+voting = VotingClassifier(estimators=[
+    ('rf', rf_best),
+    ('svm', svm_best)
+], voting='soft', n_jobs=-1)
+voting.fit(X_train, y_train)
+y_pred_vote = voting.predict(X_test)
+print("Ensemble (RF + Tuned SVM) accuracy: %.4f" % accuracy_score(y_test, y_pred_vote))
+print("Ensemble Classification Report:\n", classification_report(y_test, y_pred_vote, target_names=le.classes_))
